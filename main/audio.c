@@ -20,6 +20,17 @@
 
 static i2s_chan_handle_t i2s_tx, i2s_rx;
 static esp_codec_dev_handle_t mic, speaker;
+static volatile bool stopping; // set before deep sleep: audio tasks park instead of touching closed codecs
+_Static_assert(SPK_RATE%MIC_RATE==0,"mic rate must divide the shared I2S rate");
+static bool i2c_present(uint8_t addr7) {
+    i2c_cmd_handle_t cmd=i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd,(addr7<<1)|I2C_MASTER_WRITE,true);
+    i2c_master_stop(cmd);
+    esp_err_t err=i2c_master_cmd_begin(I2C_PORT,cmd,pdMS_TO_TICKS(50));
+    i2c_cmd_link_delete(cmd);
+    return err==ESP_OK;
+}
 // NS4150B enable is on the TCA9555 I/O expander (P10), not a GPIO.
 static void amp_enable(bool on) {
     uint8_t out[2]={0x03,on?(1<<TCA9555_PA_EN_BIT):0};  // output port 1
@@ -141,6 +152,7 @@ static void capture_task(void *arg) {
     static uint8_t packet[400];
     int peak=0; unsigned sent=0, failed=0, muted=0, frames=0;
     for (;;) {
+        if (stopping) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
         if (esp_codec_dev_read(mic,raw,sizeof(raw))!=ESP_CODEC_DEV_OK) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
         int fpeak=0;
         for (int i=0;i<MIC_SAMPLES;i++) {
@@ -186,6 +198,7 @@ static void capture_task(void *arg) {
 static void playback_task(void *arg) {
     static int16_t stereo[SPK_SAMPLES*2];
     for (;;) {
+        if (stopping) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
         size_t len=0;
         if (!primed) {
             UBaseType_t queued=0;
@@ -213,7 +226,8 @@ static void playback_task(void *arg) {
             if (primed) { primed=false; underruns++; } // ran dry: rebuffer before resuming
             // Clear previous DMA contents so an underrun cannot repeat old speech.
             memset(stereo,0,sizeof(stereo));
-            esp_codec_dev_write(speaker,stereo,sizeof(stereo));
+            // A failed write returns immediately: back off so this loop cannot spin.
+            if (esp_codec_dev_write(speaker,stereo,sizeof(stereo))!=ESP_CODEC_DEV_OK) vTaskDelay(pdMS_TO_TICKS(20));
         }
         xSemaphoreTake(gate,portMAX_DELAY);
         if (speaking && esp_timer_get_time()-last_voice_us>PLAYBACK_HANGOVER_MS*1000LL) {
@@ -231,7 +245,9 @@ static void playback_task(void *arg) {
     }
 }
 void audio_shutdown(void) {
-    // Before deep sleep: amp off, codecs into their low-power state.
+    // Before deep sleep: park the audio tasks, amp off, codecs into low power.
+    stopping=true;
+    vTaskDelay(pdMS_TO_TICKS(150)); // longer than one blocking 20 ms read/write
     amp_enable(false);
     esp_codec_dev_close(speaker);
     esp_codec_dev_close(mic);
@@ -241,6 +257,9 @@ void audio_init(void) {
         .sda_pullup_en=GPIO_PULLUP_ENABLE,.scl_pullup_en=GPIO_PULLUP_ENABLE,.master.clk_speed=100000};
     ESP_ERROR_CHECK(i2c_param_config(I2C_PORT,&i2c));
     ESP_ERROR_CHECK(i2c_driver_install(I2C_PORT,I2C_MODE_MASTER,0,0,0));
+    ESP_LOGI(TAG,"I2C check: ES8311(0x18) %s, ES7210(0x40) %s, TCA9555(0x20) %s",
+        i2c_present(ES8311_I2C_ADDR>>1)?"ok":"MISSING",i2c_present(ES7210_I2C_ADDR>>1)?"ok":"MISSING",
+        i2c_present(TCA9555_I2C_ADDR)?"ok":"MISSING");
     // TCA9555: amp off first, then make P10 an output (all other pins stay inputs).
     amp_enable(false);
     uint8_t dir[2]={0x07,(uint8_t)~(1<<TCA9555_PA_EN_BIT)}; // configuration port 1
