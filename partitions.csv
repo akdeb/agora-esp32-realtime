@@ -1,0 +1,7 @@
+# Name, Type, SubType, Offset, Size
+# Matches the layout already on the board so NVS and data partitions are kept.
+nvs,data,nvs,0x9000,0x6000
+phy_init,data,phy,0xf000,0x1000
+factory,app,factory,0x10000,0x2f0000
+model,data,0x40,0x300000,0x600000
+aurora,data,0x41,0x900000,0x700000

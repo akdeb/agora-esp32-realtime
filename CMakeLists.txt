@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.16)
+if(NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/components/agora_iot_sdk/CMakeLists.txt")
+    message(FATAL_ERROR "Agora ESP32-S3 SDK is missing. Run: bash scripts/fetch_sdk.sh")
+endif()
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+project(elato_agora)

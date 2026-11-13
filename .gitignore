@@ -1,0 +1,13 @@
+.env
+server/.env
+main/bootstrap.h
+__pycache__/
+*.pyc
+build/
+.pio/
+.tools/
+sdkconfig
+sdkconfig.old
+components/agora_iot_sdk/
+dist/
+managed_components/
