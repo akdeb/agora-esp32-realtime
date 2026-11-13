@@ -21,6 +21,7 @@ bool wifi_wait(unsigned timeout_ms);
 bool wifi_connected(void);
 void wifi_forget(void);
 void audio_init(void);
+void audio_shutdown(void);
 void audio_receive_opus(const void *data, size_t len);
 void audio_set_session(bool enabled);
 void audio_set_user_mute(bool muted);

@@ -3,7 +3,10 @@
 #include "app.h"
 #include "board.h"
 #include "driver/i2s_std.h"
+#include "driver/i2c.h"
 #include "driver/gpio.h"
+#include "esp_codec_dev.h"
+#include "esp_codec_dev_defaults.h"
 #include "esp_timer.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -15,7 +18,13 @@
 #include "esp_opus_dec.h"
 #include "esp_opus_enc.h"
 
-static i2s_chan_handle_t mic, speaker;
+static i2s_chan_handle_t i2s_tx, i2s_rx;
+static esp_codec_dev_handle_t mic, speaker;
+// NS4150B enable is on the TCA9555 I/O expander (P10), not a GPIO.
+static void amp_enable(bool on) {
+    uint8_t out[2]={0x03,on?(1<<TCA9555_PA_EN_BIT):0};  // output port 1
+    i2c_master_write_to_device(I2C_PORT,TCA9555_I2C_ADDR,out,2,pdMS_TO_TICKS(50));
+}
 static RingbufHandle_t playback, packets;
 static void *opus_dec, *opus_enc;
 static uint32_t decode_errors, packet_drops;
@@ -39,7 +48,7 @@ static void status(void) { ui_set(!session_enabled?UI_IDLE:speaking?UI_SPEAKING:
 void audio_set_session(bool enabled) {
     xSemaphoreTake(gate,portMAX_DELAY);
     session_enabled=enabled;
-    if (!enabled) { speaking=false; discard=false; gpio_set_level(AMP_ENABLE,0); }
+    if (!enabled) { speaking=false; discard=false; amp_enable(false); }
     status();
     xSemaphoreGive(gate);
 }
@@ -79,7 +88,7 @@ static void audio_receive(const void *data,size_t len) {
         }
         if (!speaking) {
             speaking=true; // Gate uplink BEFORE the first speaker frame is queued.
-            gpio_set_level(AMP_ENABLE,1); status();
+            amp_enable(true); status();
             ESP_LOGI(TAG,"Speaking: microphone uplink muted");
         }
     }
@@ -98,7 +107,7 @@ bool audio_interrupt(void) {
         size_t len; void *item;
         while ((item=xRingbufferReceive(playback,&len,0))) vRingbufferReturnItem(playback,item);
         primed=false; speaking=false;
-        gpio_set_level(AMP_ENABLE,0); status();
+        amp_enable(false); status();
         ESP_LOGI(TAG,"Interrupted by button: listening");
     }
     xSemaphoreGive(gate);
@@ -126,18 +135,19 @@ static void decode_task(void *arg) {
     }
 }
 static void capture_task(void *arg) {
-    // ICS-43434: 24-bit signed data, left-aligned in a 32-bit left slot.
-    static int32_t raw[MIC_SAMPLES*2];
+    // ES7210 delivers 16-bit stereo at SPK_RATE: left = MIC1, right = MIC2.
+    static int16_t raw[SPK_SAMPLES*2];
     static int16_t pcm[MIC_SAMPLES], silence[MIC_SAMPLES];
     static uint8_t packet[400];
     int peak=0; unsigned sent=0, failed=0, muted=0, frames=0;
     for (;;) {
-        size_t got=0;
-        esp_err_t err=i2s_channel_read(mic,raw,sizeof(raw),&got,1000);
-        if (err!=ESP_OK || got!=sizeof(raw)) continue;
+        if (esp_codec_dev_read(mic,raw,sizeof(raw))!=ESP_CODEC_DEV_OK) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
         int fpeak=0;
         for (int i=0;i<MIC_SAMPLES;i++) {
-            pcm[i]=(int16_t)(raw[i*2]>>16);
+            // Downsample MIC1 to MIC_RATE by averaging (a simple low-pass).
+            int sum=0;
+            for (int k=0;k<MIC_DECIMATE;k++) sum+=raw[(i*MIC_DECIMATE+k)*2];
+            pcm[i]=(int16_t)(sum/MIC_DECIMATE);
             int a=abs((int)pcm[i]); if(a>fpeak) fpeak=a;
         }
         if (fpeak>peak) peak=fpeak;
@@ -195,9 +205,7 @@ static void playback_task(void *arg) {
                 // Duplicate mono into both slots: MAX98357A SD_MODE high selects
                 // a slot; both channels carry the same signal.
                 for(size_t i=0;i<n;i++) stereo[2*i]=stereo[2*i+1]=item[start+i];
-                size_t written=0;
-                esp_err_t err=i2s_channel_write(speaker,stereo,n*4,&written,1000);
-                if(err!=ESP_OK || written!=n*4) ESP_LOGW(TAG,"Speaker DMA write incomplete");
+                if(esp_codec_dev_write(speaker,stereo,n*4)!=ESP_CODEC_DEV_OK) ESP_LOGW(TAG,"Speaker write failed");
                 tx_samples+=n;
             }
             vRingbufferReturnItem(playback,item);
@@ -205,8 +213,7 @@ static void playback_task(void *arg) {
             if (primed) { primed=false; underruns++; } // ran dry: rebuffer before resuming
             // Clear previous DMA contents so an underrun cannot repeat old speech.
             memset(stereo,0,sizeof(stereo));
-            size_t written=0;
-            i2s_channel_write(speaker,stereo,sizeof(stereo),&written,100);
+            esp_codec_dev_write(speaker,stereo,sizeof(stereo));
         }
         xSemaphoreTake(gate,portMAX_DELAY);
         if (speaking && esp_timer_get_time()-last_voice_us>PLAYBACK_HANGOVER_MS*1000LL) {
@@ -215,7 +222,7 @@ static void playback_task(void *arg) {
             UBaseType_t waiting=0;
             vRingbufferGetInfo(playback,NULL,NULL,NULL,NULL,&waiting);
             if (waiting==0) {
-                gpio_set_level(AMP_ENABLE,0);
+                amp_enable(false);
                 speaking=false; status();
                 ESP_LOGI(TAG,"Listening");
             }
@@ -223,11 +230,22 @@ static void playback_task(void *arg) {
         xSemaphoreGive(gate);
     }
 }
+void audio_shutdown(void) {
+    // Before deep sleep: amp off, codecs into their low-power state.
+    amp_enable(false);
+    esp_codec_dev_close(speaker);
+    esp_codec_dev_close(mic);
+}
 void audio_init(void) {
-    gpio_config_t io={.pin_bit_mask=1ULL<<AMP_ENABLE,.mode=GPIO_MODE_OUTPUT};
-    ESP_ERROR_CHECK(gpio_config(&io));
-    gpio_hold_dis(AMP_ENABLE);
-    gpio_set_level(AMP_ENABLE,0);
+    i2c_config_t i2c={.mode=I2C_MODE_MASTER,.sda_io_num=I2C_SDA,.scl_io_num=I2C_SCL,
+        .sda_pullup_en=GPIO_PULLUP_ENABLE,.scl_pullup_en=GPIO_PULLUP_ENABLE,.master.clk_speed=100000};
+    ESP_ERROR_CHECK(i2c_param_config(I2C_PORT,&i2c));
+    ESP_ERROR_CHECK(i2c_driver_install(I2C_PORT,I2C_MODE_MASTER,0,0,0));
+    // TCA9555: amp off first, then make P10 an output (all other pins stay inputs).
+    amp_enable(false);
+    uint8_t dir[2]={0x07,(uint8_t)~(1<<TCA9555_PA_EN_BIT)}; // configuration port 1
+    if (i2c_master_write_to_device(I2C_PORT,TCA9555_I2C_ADDR,dir,2,pdMS_TO_TICKS(50))!=ESP_OK)
+        ESP_LOGE(TAG,"TCA9555 not responding: the amplifier cannot be enabled");
     gate=xSemaphoreCreateMutex();
     playback=xRingbufferCreate(SPK_RATE*2*PLAYBACK_BUFFER_S,RINGBUF_TYPE_NOSPLIT); // in PSRAM
     packets=xRingbufferCreate(32768,RINGBUF_TYPE_NOSPLIT);
@@ -240,27 +258,38 @@ void audio_init(void) {
     enc.frame_duration=ESP_OPUS_ENC_FRAME_DURATION_20_MS;
     enc.application_mode=ESP_OPUS_ENC_APPLICATION_VOIP; enc.complexity=1;
     assert(esp_opus_enc_open(&enc,sizeof(enc),&opus_enc)==ESP_AUDIO_ERR_OK);
-    i2s_chan_config_t rx=I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0,I2S_ROLE_MASTER);
-    rx.dma_desc_num=6; rx.dma_frame_num=MIC_SAMPLES;
-    ESP_ERROR_CHECK(i2s_new_channel(&rx,NULL,&mic));
-    i2s_std_config_t in={
-        .clk_cfg=I2S_STD_CLK_DEFAULT_CONFIG(MIC_RATE),
-        .slot_cfg=I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT,I2S_SLOT_MODE_STEREO),
-        .gpio_cfg={.mclk=I2S_GPIO_UNUSED,.bclk=MIC_BCLK,.ws=MIC_WS,.dout=I2S_GPIO_UNUSED,.din=MIC_DATA}
-    };
-    ESP_ERROR_CHECK(i2s_channel_init_std_mode(mic,&in));
-    i2s_chan_config_t tx=I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1,I2S_ROLE_MASTER);
-    tx.dma_desc_num=8; tx.dma_frame_num=SPK_SAMPLES/2;
-    tx.auto_clear=true;
-    ESP_ERROR_CHECK(i2s_new_channel(&tx,&speaker,NULL));
-    i2s_std_config_t out={
+    // One full-duplex I2S port: ADC and DAC share MCLK/BCLK/WS.
+    i2s_chan_config_t chan=I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0,I2S_ROLE_MASTER);
+    chan.dma_desc_num=8; chan.dma_frame_num=SPK_SAMPLES/2; chan.auto_clear=true;
+    ESP_ERROR_CHECK(i2s_new_channel(&chan,&i2s_tx,&i2s_rx));
+    i2s_std_config_t std={
         .clk_cfg=I2S_STD_CLK_DEFAULT_CONFIG(SPK_RATE),
         .slot_cfg=I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,I2S_SLOT_MODE_STEREO),
-        .gpio_cfg={.mclk=I2S_GPIO_UNUSED,.bclk=AMP_BCLK,.ws=AMP_WS,.dout=AMP_DATA,.din=I2S_GPIO_UNUSED}
+        .gpio_cfg={.mclk=I2S_MCLK,.bclk=I2S_BCLK,.ws=I2S_WS,.dout=I2S_DOUT,.din=I2S_DIN}
     };
-    ESP_ERROR_CHECK(i2s_channel_init_std_mode(speaker,&out));
-    ESP_ERROR_CHECK(i2s_channel_enable(mic));
-    ESP_ERROR_CHECK(i2s_channel_enable(speaker));
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(i2s_tx,&std));
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(i2s_rx,&std));
+    audio_codec_i2s_cfg_t i2s_cfg={.port=I2S_NUM_0,.rx_handle=i2s_rx,.tx_handle=i2s_tx};
+    const audio_codec_data_if_t *data_if=audio_codec_new_i2s_data(&i2s_cfg);
+    audio_codec_i2c_cfg_t dac_i2c={.port=I2C_PORT,.addr=ES8311_I2C_ADDR};
+    audio_codec_i2c_cfg_t adc_i2c={.port=I2C_PORT,.addr=ES7210_I2C_ADDR};
+    es8311_codec_cfg_t dac={.ctrl_if=audio_codec_new_i2c_ctrl(&dac_i2c),.gpio_if=audio_codec_new_gpio(),
+        .codec_mode=ESP_CODEC_DEV_WORK_MODE_DAC,.pa_pin=-1,.use_mclk=true,
+        .hw_gain={.pa_voltage=5.0,.codec_dac_voltage=3.3}};
+    es7210_codec_cfg_t adc={.ctrl_if=audio_codec_new_i2c_ctrl(&adc_i2c),
+        .mic_selected=ES7210_SEL_MIC1|ES7210_SEL_MIC2};
+    esp_codec_dev_cfg_t out_cfg={.dev_type=ESP_CODEC_DEV_TYPE_OUT,.codec_if=es8311_codec_new(&dac),.data_if=data_if};
+    esp_codec_dev_cfg_t in_cfg={.dev_type=ESP_CODEC_DEV_TYPE_IN,.codec_if=es7210_codec_new(&adc),.data_if=data_if};
+    assert(data_if && dac.ctrl_if && adc.ctrl_if);
+    if (!out_cfg.codec_if || !in_cfg.codec_if) ESP_LOGE(TAG,"Codec not responding on I2C (ES8311 %p, ES7210 %p)",out_cfg.codec_if,in_cfg.codec_if);
+    speaker=esp_codec_dev_new(&out_cfg);
+    mic=esp_codec_dev_new(&in_cfg);
+    assert(speaker && mic);
+    esp_codec_dev_sample_info_t fs={.sample_rate=SPK_RATE,.channel=2,.bits_per_sample=16};
+    if (esp_codec_dev_open(speaker,&fs)!=ESP_CODEC_DEV_OK) ESP_LOGE(TAG,"ES8311 open failed");
+    if (esp_codec_dev_open(mic,&fs)!=ESP_CODEC_DEV_OK) ESP_LOGE(TAG,"ES7210 open failed");
+    esp_codec_dev_set_out_vol(speaker,SPEAKER_VOLUME);
+    esp_codec_dev_set_in_gain(mic,MIC_GAIN_DB);
     assert(xTaskCreateStaticPinnedToCore(capture_task,"mic",sizeof(mic_stack),NULL,6,mic_stack,&mic_tcb,0));
     assert(xTaskCreateStaticPinnedToCore(decode_task,"opusdec",sizeof(dec_stack),NULL,7,dec_stack,&dec_tcb,1));
     assert(xTaskCreate(playback_task,"speaker",8192,NULL,7,NULL)==pdPASS);

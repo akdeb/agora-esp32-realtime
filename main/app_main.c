@@ -20,12 +20,12 @@ static void enter_sleep(session_t *session) {
     rtc_leave();
     if(session && session->session_id[0]) control_action("stop",session);
     esp_wifi_stop();
-    // Wait for release, then hold LEDs and amp off across deep sleep.
+    // Wait for release, then amp off and LEDs held off across deep sleep.
     while(!gpio_get_level(BUTTON_GPIO)) vTaskDelay(pdMS_TO_TICKS(10));
     vTaskDelay(pdMS_TO_TICKS(100));
-    gpio_set_level(AMP_ENABLE,0);
+    audio_shutdown();
     gpio_set_level(LED_R,1); gpio_set_level(LED_G,1); gpio_set_level(LED_B,1);
-    gpio_hold_en(AMP_ENABLE); gpio_hold_en(LED_R); gpio_hold_en(LED_G); gpio_hold_en(LED_B);
+    gpio_hold_en(LED_R); gpio_hold_en(LED_G); gpio_hold_en(LED_B);
     gpio_deep_sleep_hold_en();
     ESP_ERROR_CHECK(rtc_gpio_init(BUTTON_GPIO));
     ESP_ERROR_CHECK(rtc_gpio_set_direction(BUTTON_GPIO,RTC_GPIO_MODE_INPUT_ONLY));
